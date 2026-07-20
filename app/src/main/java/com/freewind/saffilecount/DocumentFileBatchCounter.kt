@@ -2,83 +2,105 @@ package com.freewind.saffilecount
 
 import android.content.Context
 import android.net.Uri
+import android.os.SystemClock
 import androidx.documentfile.provider.DocumentFile
 
 /**
- * 批式扫描：DocumentFile.listFiles() 一次返回整目录子项数组，
- * 过程中无法逐文件回调 → Progress 只报「当前目录」与「该目录拿到多少项」。
- * listFiles 返回的 DocumentFile 上读 name/length() 不算另开 API 访问该文件。
+ * 批式扫描：DocumentFile.listFiles() 一次返回整目录子项。
+ * 每个文件相关 API 单独计时；目录级大操作再报总耗时。
  */
 object DocumentFileBatchCounter {
 
     /**
-     * 递归统计 treeUri 下全部文件（不含目录本身）。
-     * @param onFileListed 每认出一个文件就回调（path + sizeBytes），供信息区追加
+     * @param onEvent 过程事件（同时进 Progress 当前块 + 信息区追加）
      * @return 文件总数
      */
     fun countFiles(
         context: Context,
         treeUri: Uri,
-        onProgress: (String) -> Unit,
-        onFileListed: (path: String, sizeBytes: Long) -> Unit,
+        onEvent: (String) -> Unit,
     ): Int {
-        // 从 tree URI 打开根目录 DocumentFile
+        val openStart = SystemClock.elapsedRealtime()
         val root = DocumentFile.fromTreeUri(context, treeUri)
             ?: throw IllegalArgumentException("DocumentFile.fromTreeUri() 无法打开目录: $treeUri")
+        onEvent("fromTreeUri()  ${elapsedMs(openStart)}ms  uri=$treeUri")
 
-        // 累计整棵树的文件数
         var totalFiles = 0
 
-        // 深度优先走遍所有目录
         fun walk(dir: DocumentFile, dirLabel: String) {
-            // 批式 API：先报「正在扫哪个目录」
-            onProgress("扫描目录 $dirLabel …")
+            val dirStart = SystemClock.elapsedRealtime()
+            onEvent("开始扫描目录 $dirLabel")
 
-            // listFiles 阻塞到整目录子项一次返回
+            val listStart = SystemClock.elapsedRealtime()
             val children = dir.listFiles()
+            onEvent("  listFiles()  ${elapsedMs(listStart)}ms  → ${children.size} 项")
 
-            // 本目录内文件数 / 子目录数（仅本层，非递归）
             var fileInDir = 0
             val subDirs = mutableListOf<Pair<DocumentFile, String>>()
 
             for (child in children) {
-                when {
-                    child.isDirectory -> {
-                        // 子目录名；无名则报错，禁止 silent skip
-                        val name = child.name
-                            ?: throw IllegalStateException("子目录无 displayName，uri=${child.uri}")
-                        val childLabel = if (dirLabel == "/") name else "$dirLabel/$name"
-                        subDirs += child to childLabel
-                    }
-                    child.isFile -> {
-                        val name = child.name
-                            ?: throw IllegalStateException("文件无 displayName，uri=${child.uri}")
-                        val childLabel = if (dirLabel == "/") name else "$dirLabel/$name"
-                        // length() 来自 listFiles 返回的 DocumentFile，不算另开 API
-                        val sizeBytes = child.length()
-                        fileInDir += 1
-                        totalFiles += 1
-                        onFileListed(childLabel, sizeBytes)
-                    }
-                    else -> {
-                        // 既非目录也非文件 → 异常状态，必须可见
-                        throw IllegalStateException(
-                            "未知条目：isDirectory=false isFile=false uri=${child.uri}",
-                        )
-                    }
+                val isDirStart = SystemClock.elapsedRealtime()
+                val isDirectory = child.isDirectory
+                val isDirMs = elapsedMs(isDirStart)
+
+                if (isDirectory) {
+                    val nameStart = SystemClock.elapsedRealtime()
+                    val name = child.name
+                        ?: throw IllegalStateException("子目录无 displayName，uri=${child.uri}")
+                    val nameMs = elapsedMs(nameStart)
+                    val childLabel = if (dirLabel == "/") name else "$dirLabel/$name"
+                    onEvent(
+                        "  子目录 $childLabel  isDirectory() ${isDirMs}ms  name() ${nameMs}ms",
+                    )
+                    subDirs += child to childLabel
+                    continue
                 }
+
+                val isFileStart = SystemClock.elapsedRealtime()
+                val isFile = child.isFile
+                val isFileMs = elapsedMs(isFileStart)
+                if (!isFile) {
+                    throw IllegalStateException(
+                        "未知条目：isDirectory=false isFile=false uri=${child.uri}",
+                    )
+                }
+
+                val nameStart = SystemClock.elapsedRealtime()
+                val name = child.name
+                    ?: throw IllegalStateException("文件无 displayName，uri=${child.uri}")
+                val nameMs = elapsedMs(nameStart)
+
+                val lengthStart = SystemClock.elapsedRealtime()
+                val sizeBytes = child.length()
+                val lengthMs = elapsedMs(lengthStart)
+
+                val childLabel = if (dirLabel == "/") name else "$dirLabel/$name"
+                fileInDir += 1
+                totalFiles += 1
+                onEvent(
+                    "  文件 $childLabel  size=$sizeBytes" +
+                        "  isDirectory() ${isDirMs}ms" +
+                        "  isFile() ${isFileMs}ms" +
+                        "  name() ${nameMs}ms" +
+                        "  length() ${lengthMs}ms",
+                )
             }
 
-            // 批式 Progress：该目录 listFiles 完成后报本层拿到多少文件
-            onProgress("目录 $dirLabel → ${children.size} 项，其中文件 $fileInDir")
+            onEvent(
+                "目录 $dirLabel 完成  ${elapsedMs(dirStart)}ms" +
+                    "  本层文件 $fileInDir  子目录 ${subDirs.size}",
+            )
 
-            // 再递归进子目录
             for ((subDir, label) in subDirs) {
                 walk(subDir, label)
             }
         }
 
+        val treeStart = SystemClock.elapsedRealtime()
         walk(root, "/")
+        onEvent("整树扫描完成  ${elapsedMs(treeStart)}ms  文件总数=$totalFiles")
         return totalFiles
     }
+
+    private fun elapsedMs(start: Long): Long = SystemClock.elapsedRealtime() - start
 }

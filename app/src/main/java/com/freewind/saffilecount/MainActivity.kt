@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -60,25 +61,21 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun FileCountScreen(activity: ComponentActivity) {
     val scope = rememberCoroutineScope()
-    // 用户授权的 tree URI
     var selectedTreeUri by remember { mutableStateOf<Uri?>(null) }
-    // 扫描中单行 Progress
+    // 当前事件完整文案（可换行，不截断）
     var progressText by remember { mutableStateOf("") }
-    // 信息区：每个文件一行「path  size」
-    var fileListText by remember { mutableStateOf("") }
-    // 最终结果（文件数量）
+    // 全部事件日志（含耗时）
+    var logText by remember { mutableStateOf("") }
     var resultText by remember { mutableStateOf("请先选择目录，再选一种计数方式。") }
     var isScanning by remember { mutableStateOf(false) }
-    // 信息区滚动；文件追加时自动滚到底
-    val fileListScroll = rememberScrollState()
+    val logScroll = rememberScrollState()
 
-    LaunchedEffect(fileListText) {
-        if (fileListText.isNotEmpty()) {
-            fileListScroll.scrollTo(fileListScroll.maxValue)
+    LaunchedEffect(logText) {
+        if (logText.isNotEmpty()) {
+            logScroll.scrollTo(logScroll.maxValue)
         }
     }
 
-    // SAF 选目录
     val openTreeLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
@@ -86,7 +83,6 @@ private fun FileCountScreen(activity: ComponentActivity) {
             resultText = "未选择目录。"
             return@rememberLauncherForActivityResult
         }
-        // 持久化读权限；失败必须可见
         runCatching {
             activity.contentResolver.takePersistableUriPermission(
                 uri,
@@ -98,48 +94,34 @@ private fun FileCountScreen(activity: ComponentActivity) {
         }
         selectedTreeUri = uri
         progressText = ""
-        fileListText = ""
+        logText = ""
         resultText = "已选目录：\n$uri"
     }
 
-    /** 在 IO 线程跑计数，主线程刷 Progress / 信息区 / 结果 */
     fun runCount(
         label: String,
-        counter: (
-            treeUri: Uri,
-            onProgress: (String) -> Unit,
-            onFileListed: (path: String, sizeBytes: Long) -> Unit,
-        ) -> Int,
+        counter: (treeUri: Uri, onEvent: (String) -> Unit) -> Int,
     ) {
         val treeUri = selectedTreeUri ?: return
         isScanning = true
         progressText = "准备 $label …"
-        fileListText = ""
+        logText = ""
         resultText = ""
         scope.launch {
             try {
                 val total = withContext(Dispatchers.IO) {
-                    counter(
-                        treeUri,
-                        { message ->
-                            scope.launch(Dispatchers.Main.immediate) {
-                                progressText = message
-                            }
-                        },
-                        { path, sizeBytes ->
-                            // 信息区追加一行：文件名 + size（同次 list/query 已有，无另开访问）
-                            val line = "$path  $sizeBytes"
-                            scope.launch(Dispatchers.Main.immediate) {
-                                fileListText =
-                                    if (fileListText.isEmpty()) line else "$fileListText\n$line"
-                            }
-                        },
-                    )
+                    counter(treeUri) { message ->
+                        // 当前块完整显示；同时追加到信息区
+                        scope.launch(Dispatchers.Main.immediate) {
+                            progressText = message
+                            logText = if (logText.isEmpty()) message else "$logText\n$message"
+                        }
+                    }
                 }
-                progressText = "完成"
+                progressText = "完成  文件数量=$total"
                 resultText = "$label\n文件数量：$total"
             } catch (error: Exception) {
-                progressText = "失败"
+                progressText = "失败：${error.message ?: error.javaClass.simpleName}"
                 resultText = "扫描失败：${error.message ?: error.javaClass.simpleName}"
             }
             isScanning = false
@@ -157,7 +139,7 @@ private fun FileCountScreen(activity: ComponentActivity) {
             style = MaterialTheme.typography.titleMedium,
         )
         Text(
-            text = "批式 listFiles：Progress=目录级；流式 query：Progress=文件名。信息区写 name+size（list/query 已有字段，含 length()；不另开访问 API）。",
+            text = "文件相关 API 各记耗时；大操作含小操作时两边都记。上方当前事件完整显示；下方全部日志可滚。",
             style = MaterialTheme.typography.bodyMedium,
         )
         OutlinedButton(onClick = { openTreeLauncher.launch(null) }) {
@@ -167,13 +149,8 @@ private fun FileCountScreen(activity: ComponentActivity) {
             modifier = Modifier.fillMaxWidth(),
             enabled = selectedTreeUri != null && !isScanning,
             onClick = {
-                runCount("DocumentFile.listFiles（批式）") { treeUri, onProgress, onFileListed ->
-                    DocumentFileBatchCounter.countFiles(
-                        activity,
-                        treeUri,
-                        onProgress,
-                        onFileListed,
-                    )
+                runCount("DocumentFile.listFiles（批式）") { treeUri, onEvent ->
+                    DocumentFileBatchCounter.countFiles(activity, treeUri, onEvent)
                 }
             },
         ) {
@@ -183,46 +160,42 @@ private fun FileCountScreen(activity: ComponentActivity) {
             modifier = Modifier.fillMaxWidth(),
             enabled = selectedTreeUri != null && !isScanning,
             onClick = {
-                runCount("ContentResolver.query（流式）") { treeUri, onProgress, onFileListed ->
-                    DocumentsContractStreamCounter.countFiles(
-                        activity,
-                        treeUri,
-                        onProgress,
-                        onFileListed,
-                    )
+                runCount("ContentResolver.query（流式）") { treeUri, onEvent ->
+                    DocumentsContractStreamCounter.countFiles(activity, treeUri, onEvent)
                 }
             },
         ) {
             Text("ContentResolver.query（流式）")
         }
-        if (isScanning || progressText.isNotEmpty()) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (isScanning) {
-                    CircularProgressIndicator(modifier = Modifier.size(20.dp))
-                }
-                Text(
-                    text = progressText.ifEmpty { "…" },
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 13.sp,
-                    maxLines = 1,
-                )
+        // 当前事件：完整显示，可换行，不 maxLines 截断
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top,
+        ) {
+            if (isScanning) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp))
             }
+            Text(
+                text = progressText.ifEmpty { "（当前事件）" },
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 40.dp),
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+            )
         }
-        // 固定高度信息区：文件多时内部滚动
+        // 全部过程日志：固定高度可滚
         Text(
-            text = fileListText.ifEmpty { "（文件列表）" },
+            text = logText.ifEmpty { "（过程日志：API + 耗时 ms）" },
             modifier = Modifier
                 .fillMaxWidth()
-                .height(220.dp)
+                .height(280.dp)
                 .border(1.dp, MaterialTheme.colorScheme.outline)
                 .padding(8.dp)
-                .verticalScroll(fileListScroll),
+                .verticalScroll(logScroll),
             fontFamily = FontFamily.Monospace,
             fontSize = 12.sp,
             lineHeight = 16.sp,
