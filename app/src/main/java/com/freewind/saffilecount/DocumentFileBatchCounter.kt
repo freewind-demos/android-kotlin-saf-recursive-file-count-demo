@@ -7,17 +7,20 @@ import androidx.documentfile.provider.DocumentFile
 /**
  * 批式扫描：DocumentFile.listFiles() 一次返回整目录子项数组，
  * 过程中无法逐文件回调 → Progress 只报「当前目录」与「该目录拿到多少项」。
+ * listFiles 返回的 DocumentFile 上读 name/length() 不算另开 API 访问该文件。
  */
 object DocumentFileBatchCounter {
 
     /**
      * 递归统计 treeUri 下全部文件（不含目录本身）。
+     * @param onFileListed 每认出一个文件就回调（path + sizeBytes），供信息区追加
      * @return 文件总数
      */
     fun countFiles(
         context: Context,
         treeUri: Uri,
         onProgress: (String) -> Unit,
+        onFileListed: (path: String, sizeBytes: Long) -> Unit,
     ): Int {
         // 从 tree URI 打开根目录 DocumentFile
         val root = DocumentFile.fromTreeUri(context, treeUri)
@@ -48,8 +51,14 @@ object DocumentFileBatchCounter {
                         subDirs += child to childLabel
                     }
                     child.isFile -> {
+                        val name = child.name
+                            ?: throw IllegalStateException("文件无 displayName，uri=${child.uri}")
+                        val childLabel = if (dirLabel == "/") name else "$dirLabel/$name"
+                        // length() 来自 listFiles 返回的 DocumentFile，不算另开 API
+                        val sizeBytes = child.length()
                         fileInDir += 1
                         totalFiles += 1
+                        onFileListed(childLabel, sizeBytes)
                     }
                     else -> {
                         // 既非目录也非文件 → 异常状态，必须可见

@@ -7,24 +7,28 @@ import android.provider.DocumentsContract
 /**
  * 流式扫描：ContentResolver.query + Cursor.moveToNext，
  * 每拿到一行就能访问该条目 → Progress 报当前文件名；结束返回总数。
+ * SIZE 列在同一 cursor 行里，不算另开 API 访问该文件。
  */
 object DocumentsContractStreamCounter {
 
-    // 列目录只需 id / 名 / mime；mime 用来区分目录与文件
+    // id / 名 / mime / size；mime 区分目录与文件，size 直接进信息区
     private val projection = arrayOf(
         DocumentsContract.Document.COLUMN_DOCUMENT_ID,
         DocumentsContract.Document.COLUMN_DISPLAY_NAME,
         DocumentsContract.Document.COLUMN_MIME_TYPE,
+        DocumentsContract.Document.COLUMN_SIZE,
     )
 
     /**
      * 递归统计 treeUri 下全部文件（不含目录本身）。
+     * @param onFileListed 每认出一个文件就回调（path + sizeBytes），供信息区追加
      * @return 文件总数
      */
     fun countFiles(
         context: Context,
         treeUri: Uri,
         onProgress: (String) -> Unit,
+        onFileListed: (path: String, sizeBytes: Long) -> Unit,
     ): Int {
         val contentResolver = context.contentResolver
         // tree 根 documentId
@@ -50,6 +54,7 @@ object DocumentsContractStreamCounter {
                 val idIndex = rows.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
                 val nameIndex = rows.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
                 val mimeIndex = rows.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIndex = rows.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
 
                 // 流式：每 moveToNext 一次就能访问当前行
                 while (rows.moveToNext()) {
@@ -66,9 +71,11 @@ object DocumentsContractStreamCounter {
                         onProgress("目录 $childLabel")
                         subDirs += documentId to childLabel
                     } else {
-                        // 文件：Progress 写当前文件名
+                        // 文件：Progress 写当前文件名；size 来自同 cursor 行
+                        val sizeBytes = if (rows.isNull(sizeIndex)) 0L else rows.getLong(sizeIndex)
                         totalFiles += 1
                         onProgress("文件 $childLabel")
+                        onFileListed(childLabel, sizeBytes)
                     }
                 }
             }

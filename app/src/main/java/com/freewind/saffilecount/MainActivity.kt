@@ -8,13 +8,17 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -22,6 +26,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -59,9 +64,19 @@ private fun FileCountScreen(activity: ComponentActivity) {
     var selectedTreeUri by remember { mutableStateOf<Uri?>(null) }
     // 扫描中单行 Progress
     var progressText by remember { mutableStateOf("") }
+    // 信息区：每个文件一行「path  size」
+    var fileListText by remember { mutableStateOf("") }
     // 最终结果（文件数量）
     var resultText by remember { mutableStateOf("请先选择目录，再选一种计数方式。") }
     var isScanning by remember { mutableStateOf(false) }
+    // 信息区滚动；文件追加时自动滚到底
+    val fileListScroll = rememberScrollState()
+
+    LaunchedEffect(fileListText) {
+        if (fileListText.isNotEmpty()) {
+            fileListScroll.scrollTo(fileListScroll.maxValue)
+        }
+    }
 
     // SAF 选目录
     val openTreeLauncher = rememberLauncherForActivityResult(
@@ -83,24 +98,43 @@ private fun FileCountScreen(activity: ComponentActivity) {
         }
         selectedTreeUri = uri
         progressText = ""
+        fileListText = ""
         resultText = "已选目录：\n$uri"
     }
 
-    /** 在 IO 线程跑计数，主线程刷 Progress / 结果 */
-    fun runCount(label: String, counter: (Uri, (String) -> Unit) -> Int) {
+    /** 在 IO 线程跑计数，主线程刷 Progress / 信息区 / 结果 */
+    fun runCount(
+        label: String,
+        counter: (
+            treeUri: Uri,
+            onProgress: (String) -> Unit,
+            onFileListed: (path: String, sizeBytes: Long) -> Unit,
+        ) -> Int,
+    ) {
         val treeUri = selectedTreeUri ?: return
         isScanning = true
         progressText = "准备 $label …"
+        fileListText = ""
         resultText = ""
         scope.launch {
             try {
                 val total = withContext(Dispatchers.IO) {
-                    counter(treeUri) { message ->
-                        // Progress 回调可能在 IO 线程 → 切主线程更新一行文案
-                        scope.launch(Dispatchers.Main.immediate) {
-                            progressText = message
-                        }
-                    }
+                    counter(
+                        treeUri,
+                        { message ->
+                            scope.launch(Dispatchers.Main.immediate) {
+                                progressText = message
+                            }
+                        },
+                        { path, sizeBytes ->
+                            // 信息区追加一行：文件名 + size（同次 list/query 已有，无另开访问）
+                            val line = "$path  $sizeBytes"
+                            scope.launch(Dispatchers.Main.immediate) {
+                                fileListText =
+                                    if (fileListText.isEmpty()) line else "$fileListText\n$line"
+                            }
+                        },
+                    )
                 }
                 progressText = "完成"
                 resultText = "$label\n文件数量：$total"
@@ -123,7 +157,7 @@ private fun FileCountScreen(activity: ComponentActivity) {
             style = MaterialTheme.typography.titleMedium,
         )
         Text(
-            text = "批式 listFiles：Progress=当前目录+本层数量；流式 query：Progress=当前文件名；结束显示总数。",
+            text = "批式 listFiles：Progress=目录级；流式 query：Progress=文件名。信息区写 name+size（list/query 已有字段，含 length()；不另开访问 API）。",
             style = MaterialTheme.typography.bodyMedium,
         )
         OutlinedButton(onClick = { openTreeLauncher.launch(null) }) {
@@ -133,8 +167,13 @@ private fun FileCountScreen(activity: ComponentActivity) {
             modifier = Modifier.fillMaxWidth(),
             enabled = selectedTreeUri != null && !isScanning,
             onClick = {
-                runCount("DocumentFile.listFiles（批式）") { treeUri, onProgress ->
-                    DocumentFileBatchCounter.countFiles(activity, treeUri, onProgress)
+                runCount("DocumentFile.listFiles（批式）") { treeUri, onProgress, onFileListed ->
+                    DocumentFileBatchCounter.countFiles(
+                        activity,
+                        treeUri,
+                        onProgress,
+                        onFileListed,
+                    )
                 }
             },
         ) {
@@ -144,8 +183,13 @@ private fun FileCountScreen(activity: ComponentActivity) {
             modifier = Modifier.fillMaxWidth(),
             enabled = selectedTreeUri != null && !isScanning,
             onClick = {
-                runCount("ContentResolver.query（流式）") { treeUri, onProgress ->
-                    DocumentsContractStreamCounter.countFiles(activity, treeUri, onProgress)
+                runCount("ContentResolver.query（流式）") { treeUri, onProgress, onFileListed ->
+                    DocumentsContractStreamCounter.countFiles(
+                        activity,
+                        treeUri,
+                        onProgress,
+                        onFileListed,
+                    )
                 }
             },
         ) {
@@ -170,6 +214,19 @@ private fun FileCountScreen(activity: ComponentActivity) {
                 )
             }
         }
+        // 固定高度信息区：文件多时内部滚动
+        Text(
+            text = fileListText.ifEmpty { "（文件列表）" },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(220.dp)
+                .border(1.dp, MaterialTheme.colorScheme.outline)
+                .padding(8.dp)
+                .verticalScroll(fileListScroll),
+            fontFamily = FontFamily.Monospace,
+            fontSize = 12.sp,
+            lineHeight = 16.sp,
+        )
         Text(
             text = resultText,
             modifier = Modifier.fillMaxWidth(),
